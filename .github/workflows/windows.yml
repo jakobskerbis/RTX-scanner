@@ -1,0 +1,38 @@
+name: Windows EXE
+
+on:
+  push:
+    branches: [main]
+    paths: ['windows/**', '.github/workflows/windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Odvisnosti
+        run: pip install pyinstaller requests beautifulsoup4 winotify pillow
+      - name: Ikona
+        run: python windows/ikona.py
+      - name: Preizkus okna
+        working-directory: windows
+        run: python rtx_skener_win.py --test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: posnetek
+          path: windows/posnetek.png
+          if-no-files-found: ignore
+      - name: Gradnja EXE
+        run: pyinstaller --onefile --windowed --name "RTX-skener" --icon windows/ikona.ico windows/rtx_skener_win.py
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: RTX skener
+          files: dist/RTX-skener.exe

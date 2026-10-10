@@ -1,8 +1,9 @@
-name: Zgradi APK
+name: Android APK
 
 on:
   push:
     branches: [main]
+    paths: ['app/**', '*.kts', '.github/workflows/build.yml']
   workflow_dispatch:
 
 permissions:
