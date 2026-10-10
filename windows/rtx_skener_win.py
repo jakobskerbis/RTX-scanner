@@ -34,22 +34,28 @@ VIRI = {
     "Njuškalo": "https://www.njuskalo.hr/?ctl=search_ads&keywords={q}&sort=new&page={p}",
 }
 STROSKI = {"Bolha": 5, "Njuškalo": 25}
-ISKALNI_NIZI = ["rtx 3060", "rtx 3070", "rtx 3080", "rtx 3090",
-                "rtx 4060", "rtx 4070", "rtx 4080", "rtx 4090",
-                "rtx 5060", "rtx 5070", "rtx 5080", "rtx 5090"]
+# Ločena iskanja za vsako različico, da se za vsak model nabere dovolj oglasov.
+ISKALNI_NIZI = ["rtx 3060", "rtx 3060 ti", "rtx 3070", "rtx 3070 ti", "rtx 3080", "rtx 3080 ti",
+                "rtx 3090", "rtx 4060", "rtx 4060 ti", "rtx 4070", "rtx 4070 super",
+                "rtx 4070 ti", "rtx 4070 ti super", "rtx 4080", "rtx 4080 super", "rtx 4090",
+                "rtx 5060", "rtx 5060 ti", "rtx 5070", "rtx 5070 ti", "rtx 5080", "rtx 5090"]
 IZLOCI = ["kupim", "iščem", "iscem", "menjam", "zamenjam", "okvar", "defekt", "ne dela",
           "za dele", "pokvar", "prenosnik", "laptop", "notebook", "računalnik", "racunalnik",
           "gaming pc", "desktop", "komplet pc", "neispravn", "ne radi", "otkup", "kupujem",
           "računalo", "racunalo", "kućište", "blok", "hladilnik", "backplate",
           "rezervirano", "prodano", "prodana", "prodan ", "rezervirana", "artefakt",
-          "mining", "rudar", "brez ventilator", "samo škatla", "kutija", "škatla"]
+          "mining", "rudar", "brez ventilator", "samo škatla", "kutija", "škatla",
+          # kompleti s še čim (niso primerljivi s samo kartico)
+          "ryzen", "intel", "i5 ", "i7 ", "i9 ", "procesor", "matična", "maticna", "monitor",
+          "ps5", "konzol", "paket", "+ ", "riser", "nosilec",
+          "kabel", "adapter", "vodno", "waterblock", "ventilator za"]
 PLUS = ["garancij", "račun", "jamstv", "nova", "novo", "zapakiran", "neodprt"]
 
 MIN_CENA = 40
-MIN_VZORCEV = 5
+MIN_VZORCEV = 100        # tržna cena šele iz vsaj 100 primerljivih oglasov
+MAX_STRANI = 15          # največ strani na iskanje, dokler model nima 100 oglasov
 DNI_ZGODOVINE = 60
 REZERVA = 0.05
-STRANI_PRVIC = 5
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -157,16 +163,42 @@ def baza():
     return db
 
 
-def trzna_cena(db, model):
+def primerljive_cene(db, model):
+    """Cene primerljivih oglasov: isti model (in VRAM), zadnjih 60 dni, brez ponovitev
+    in brez skrajnosti (pod 50 % ali nad 160 % mediane - dodatki, kompleti, napačne cene)."""
     od = (datetime.now() - timedelta(days=DNI_ZGODOVINE)).isoformat()
     cene = sorted(r[0] for r in db.execute(
         "SELECT cena FROM oglasi WHERE model=? AND prvic_viden>=? AND cena>=? AND ponovitev=0",
         (model, od, MIN_CENA)))
+    if not cene:
+        return []
+    med = statistics.median(cene)
+    return [c for c in cene if 0.5 * med <= c <= 1.6 * med]
+
+
+def trzna_cena(db, model):
+    """Povprečje vsaj MIN_VZORCEV primerljivih oglasov (odrezanih 10 % najnižjih in najvišjih)."""
+    cene = primerljive_cene(db, model)
     if len(cene) < MIN_VZORCEV:
         return None, len(cene)
-    rez = len(cene) // 10 if len(cene) >= 10 else 0
-    cene = cene[rez:len(cene) - rez]
-    return statistics.mean(cene), len(cene)
+    rez = len(cene) // 10
+    sred = cene[rez:len(cene) - rez]
+    return statistics.mean(sred), len(cene)
+
+
+def potrebuje_vec(db, q):
+    """Ali ima kateri model, ki ga pokrije iskanje q, še manj kot MIN_VZORCEV oglasov?"""
+    osnova = "RTX " + q.split()[1]
+    dodatek = " ".join(w.title() for w in q.split()[2:])
+    vzorec = osnova + (" " + dodatek if dodatek else "")
+    modeli = [r[0] for r in db.execute("SELECT DISTINCT model FROM oglasi WHERE model LIKE ?",
+                                       (vzorec + "%",))]
+    if dodatek == "":   # 'rtx 4070' ne sme šteti 4070 Super/Ti
+        modeli = [m for m in modeli if m == osnova or m.startswith(osnova + " ") and m.endswith("GB")
+                  and not any(x in m for x in ("Ti", "Super"))]
+    if not modeli:
+        return True
+    return any(len(primerljive_cene(db, m)) < MIN_VZORCEV for m in modeli)
 
 
 def zadnji_posli(db, n=50):
@@ -181,7 +213,7 @@ def tabela_cen(db, popust):
         if trg:
             vrstice.append((model, f"{trg:.0f} €", f"{trg * (1 - popust / 100):.0f} €", n))
         else:
-            vrstice.append((model, "premalo oglasov", "–", n))
+            vrstice.append((model, f"zbiram ({n}/{MIN_VZORCEV})", "–", n))
     return vrstice
 
 
@@ -225,10 +257,7 @@ class Skener:
         while not self.stop.is_set():
             ura = datetime.now().strftime("%H:%M")
             try:
-                prvi = db.execute("SELECT COUNT(*) FROM oglasi").fetchone()[0] == 0
-                if prvi:
-                    self.stanje = "Prvi zagon: berem oglase in gradim tržne cene (nekaj minut) ..."
-                novi, posli, dnevnik = self._pregled(db, STRANI_PRVIC if prvi else 1)
+                novi, posli, dnevnik = self._pregled(db)
                 if not self.stop.is_set():
                     self.stanje = f"Zadnji pregled ob {ura} · novih oglasov: {novi} · poslov: {posli}\n{dnevnik}"
             except Exception as e:
@@ -257,13 +286,17 @@ class Skener:
             self.ob_poslu()
         return True
 
-    def _pregled(self, db, strani):
+    def _pregled(self, db):
         novi = posli = 0
         dnevnik = []
         for vir, predloga in VIRI.items():
             osnova = re.match(r"https?://[^/]+", predloga).group(0)
             skupaj, napaka = 0, None
             for q in ISKALNI_NIZI:
+                # Dokler model nima 100 primerljivih oglasov, bere več strani (tudi starejše oglase).
+                strani = MAX_STRANI if potrebuje_vec(db, q) else 1
+                if strani > 1:
+                    self.stanje = f"Zbiram oglase za tržno ceno: {vir} · {q.upper()} ..."
                 for p in range(1, strani + 1):
                     if self.stop.is_set():
                         return novi, posli, "\n".join(dnevnik)
@@ -276,6 +309,7 @@ class Skener:
                         break
                     oglasi = razcleni_stran(r.text, osnova)
                     skupaj += len(oglasi)
+                    znanih = 0
                     for o in oglasi:
                         model = zaznaj_model(o["naslov"])
                         if (not model or o["cena"] is None or o["cena"] < MIN_CENA
@@ -284,6 +318,7 @@ class Skener:
                         star = db.execute("SELECT cena, opozorjeno FROM oglasi WHERE url=?",
                                           (o["url"],)).fetchone()
                         if star:
+                            znanih += 1
                             if o["cena"] < star[0] - 1:
                                 db.execute("UPDATE oglasi SET cena=? WHERE url=?", (o["cena"], o["url"]))
                                 if not star[1]:
@@ -303,7 +338,8 @@ class Skener:
                             posli += self._posel(db, o, model, vir, trg, n)
                     db.commit()
                     self.stop.wait(random.uniform(2, 5))
-                    if not oglasi:
+                    # konec rezultatov ali (pri rednem pregledu) same že znane oglase
+                    if not oglasi or (p > 1 and znanih == len(oglasi)):
                         break
             vrstica = f"{vir}: prebranih {skupaj} oglasov"
             if napaka:
