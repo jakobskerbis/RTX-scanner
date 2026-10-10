@@ -52,9 +52,9 @@ IZLOCI = ["kupim", "iščem", "iscem", "menjam", "zamenjam", "okvar", "defekt", 
 PLUS = ["garancij", "račun", "jamstv", "nova", "novo", "zapakiran", "neodprt"]
 
 MIN_CENA = 40
-MIN_VZORCEV = 100        # tržna cena šele iz vsaj 100 primerljivih oglasov
-MAX_STRANI = 15          # največ strani na iskanje, dokler model nima 100 oglasov
-DNI_ZGODOVINE = 60
+MIN_VZORCEV = 30         # tržna cena šele iz vsaj 30 primerljivih oglasov
+MAX_STRANI = 15          # največ strani na iskanje, dokler model nima dovolj oglasov
+DNI_ZGODOVINE = 30       # upoštevaj samo oglase, objavljene v zadnjem mesecu
 REZERVA = 0.05
 
 HEADERS = {
@@ -132,6 +132,34 @@ def izlocen(naslov):
     return any(b in t for b in IZLOCI)
 
 
+DATUM_RE = re.compile(r"\b(\d{1,2})\.\s?(\d{1,2})\.\s?(\d{4})\b")
+
+
+def datum_objave(kartica):
+    """Datum objave oglasa iz kartice (<time datetime=...> ali 'dd.mm.llll'). None, če ga ni."""
+    el = kartica.select_one("time[datetime]")
+    if el:
+        try:
+            return datetime.fromisoformat(el["datetime"].strip().replace("Z", "+00:00")) \
+                .replace(tzinfo=None).isoformat()
+        except ValueError:
+            pass
+    besedilo = kartica.get_text(" ", strip=True).lower()
+    m = DATUM_RE.search(besedilo)
+    if m:
+        try:
+            return datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))).isoformat()
+        except ValueError:
+            pass
+    if "danes" in besedilo or "prije" in besedilo or "pred " in besedilo:
+        return datetime.now().replace(microsecond=0).isoformat()
+    return None
+
+
+def meja_starosti():
+    return (datetime.now() - timedelta(days=DNI_ZGODOVINE)).isoformat()
+
+
 def razcleni_stran(html, osnova):
     soup = BeautifulSoup(html, "html.parser")
     oglasi, videni = [], set()
@@ -149,7 +177,7 @@ def razcleni_stran(html, osnova):
         if cena is None:
             cena = razcleni_ceno(kartica.get_text(" ", strip=True))
         oglasi.append({"naslov": naslov, "url": url, "cena": cena,
-                       "opis": kartica.get_text(" ", strip=True)})
+                       "opis": kartica.get_text(" ", strip=True), "objavljen": datum_objave(kartica)})
     return oglasi
 
 
@@ -159,17 +187,20 @@ def baza():
     db.execute("""CREATE TABLE IF NOT EXISTS oglasi (
         url TEXT PRIMARY KEY, vir TEXT, model TEXT, naslov TEXT, cena REAL,
         prvic_viden TEXT, opozorjeno INTEGER DEFAULT 0, ponovitev INTEGER DEFAULT 0,
-        trg REAL, zasluzek REAL)""")
+        trg REAL, zasluzek REAL, objavljen TEXT)""")
+    stolpci = [r[1] for r in db.execute("PRAGMA table_info(oglasi)")]
+    if "objavljen" not in stolpci:
+        db.execute("ALTER TABLE oglasi ADD COLUMN objavljen TEXT")
     return db
 
 
 def primerljive_cene(db, model):
     """Cene primerljivih oglasov: isti model (in VRAM), zadnjih 60 dni, brez ponovitev
     in brez skrajnosti (pod 50 % ali nad 160 % mediane - dodatki, kompleti, napačne cene)."""
-    od = (datetime.now() - timedelta(days=DNI_ZGODOVINE)).isoformat()
+    # datum objave; če ga stran ne pove, datum, ko ga je skener prvič videl
     cene = sorted(r[0] for r in db.execute(
-        "SELECT cena FROM oglasi WHERE model=? AND prvic_viden>=? AND cena>=? AND ponovitev=0",
-        (model, od, MIN_CENA)))
+        "SELECT cena FROM oglasi WHERE model=? AND COALESCE(objavljen, prvic_viden)>=? "
+        "AND cena>=? AND ponovitev=0", (model, meja_starosti(), MIN_CENA)))
     if not cene:
         return []
     med = statistics.median(cene)
@@ -353,17 +384,22 @@ class Skener:
                             "SELECT 1 FROM oglasi WHERE naslov=? AND cena=? AND vir=?",
                             (o["naslov"], o["cena"], vir)).fetchone() is not None
                         trg, n = trzna_cena(db, model)
-                        db.execute("INSERT INTO oglasi (url, vir, model, naslov, cena, prvic_viden, "
-                                   "ponovitev) VALUES (?,?,?,?,?,?,?)",
+                        db.execute("INSERT INTO oglasi (url, vir, model, naslov, cena, objavljen, prvic_viden, "
+                                   "ponovitev) VALUES (?,?,?,?,?,?,?,?)",
                                    (o["url"], vir, model, o["naslov"], o["cena"],
-                                    datetime.now().isoformat(), int(ponovitev)))
+                                    o["objavljen"], datetime.now().isoformat(), int(ponovitev)))
                         novi += 1
-                        if not ponovitev:
+                        star_oglas = o["objavljen"] is not None and o["objavljen"] < meja_starosti()
+                        if not ponovitev and not star_oglas:
                             posli += self._posel(db, o, model, vir, trg, n)
                     db.commit()
                     self.stop.wait(random.uniform(2, 5))
                     # konec rezultatov ali (pri rednem pregledu) same že znane oglase
-                    if not oglasi or (p > 1 and znanih == len(oglasi)):
+                    # oglasi so razvrščeni od najnovejših: ko so vsi na strani starejši od
+                    # meseca, naprej ni več kaj iskati
+                    datumi = [o["objavljen"] for o in oglasi if o["objavljen"]]
+                    prestari = bool(datumi) and max(datumi) < meja_starosti()
+                    if not oglasi or prestari or (p > 1 and znanih == len(oglasi)):
                         break
             vrstica = f"{vir}: prebranih {skupaj} oglasov"
             if napaka:
@@ -453,7 +489,7 @@ def main():
     zavihki.add(z2, text="  Tržne cene  ")
     cene = ttk.Treeview(z2, columns=("model", "trg", "meja", "n"), show="headings")
     for s, ime, w, sidro in [("model", "Model", 180, "w"), ("trg", "Povprečna cena", 140, "e"),
-                             ("meja", "Posel pod", 120, "e"), ("n", "Št. oglasov", 100, "e")]:
+                             ("meja", "Posel pod", 120, "e"), ("n", "Oglasov (30 dni)", 120, "e")]:
         cene.heading(s, text=ime)
         cene.column(s, width=w, anchor=sidro)
     cene.pack(fill="both", expand=True)
