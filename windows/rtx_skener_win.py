@@ -27,7 +27,7 @@ os.makedirs(MAPA, exist_ok=True)
 DB_POT = os.path.join(MAPA, "rtx_skener.db")
 NAST_POT = os.path.join(MAPA, "nastavitve.json")
 
-PRIVZETO = {"popust": 25, "min_zasluzek": 40, "interval": 4, "ob_zagonu": False}
+PRIVZETO = {"popust": 25, "min_zasluzek": 40, "interval": 4, "ob_zagonu": False, "obvestila": True}
 
 VIRI = {
     "Bolha": "https://www.bolha.com/?ctl=search_ads&keywords={q}&sort=new&page={p}",
@@ -237,6 +237,7 @@ class Skener:
         self.stop = threading.Event()
         self.nit = None
         self.stanje = "Skener še ni bil zagnan."
+        self.cakajoci = []   # posli iz tega pregleda -> eno skupno obvestilo
 
     def tece(self):
         return self.nit is not None and self.nit.is_alive() and not self.stop.is_set()
@@ -257,7 +258,9 @@ class Skener:
         while not self.stop.is_set():
             ura = datetime.now().strftime("%H:%M")
             try:
+                self.cakajoci = []
                 novi, posli, dnevnik = self._pregled(db)
+                self._obvesti()
                 if not self.stop.is_set():
                     self.stanje = f"Zadnji pregled ob {ura} · novih oglasov: {novi} · poslov: {posli}\n{dnevnik}"
             except Exception as e:
@@ -271,6 +274,13 @@ class Skener:
         z = trg * (1 - REZERVA) - o["cena"] - STROSKI.get(vir, 0)
         if o["cena"] > trg * (1 - self.nast["popust"] / 100) or z < self.nast["min_zasluzek"]:
             return False
+        # isti oglas že javljen (ponovno objavljen ali hkrati na Bolhi in Njuškalu) -> brez obvestila
+        teden = (datetime.now() - timedelta(days=7)).isoformat()
+        if db.execute("SELECT 1 FROM oglasi WHERE opozorjeno=1 AND lower(naslov)=? AND url<>? "
+                      "AND prvic_viden>=?", (o["naslov"].lower(), o["url"], teden)).fetchone():
+            db.execute("UPDATE oglasi SET opozorjeno=2 WHERE url=?", (o["url"],))
+            db.commit()
+            return False
         pod = (1 - o["cena"] / trg) * 100
         plus = sorted({b for b in PLUS if b in o["opis"].lower()})
         naslov = f"{model} {o['cena']:.0f} € → zaslužek ~{z:.0f} €"
@@ -281,10 +291,24 @@ class Skener:
             vrstice.append("✓ " + ", ".join(plus))
         db.execute("UPDATE oglasi SET opozorjeno=1, trg=?, zasluzek=? WHERE url=?", (trg, z, o["url"]))
         db.commit()
-        toast(naslov, "\n".join(vrstice), o["url"])
+        self.cakajoci.append((z, naslov, "\n".join(vrstice), o["url"]))
         if self.ob_poslu:
             self.ob_poslu()
         return True
+
+    def _obvesti(self):
+        """Največ ENO obvestilo na pregled: en posel -> podrobno, več poslov -> povzetek."""
+        if not self.cakajoci or not self.nast.get("obvestila", True):
+            return
+        self.cakajoci.sort(reverse=True)
+        if len(self.cakajoci) == 1:
+            _, naslov, besedilo, url = self.cakajoci[0]
+            toast(naslov, besedilo, url)
+        else:
+            vrstice = [n for _, n, _, _ in self.cakajoci[:4]]
+            if len(self.cakajoci) > 4:
+                vrstice.append(f"... in še {len(self.cakajoci) - 4}")
+            toast(f"{len(self.cakajoci)} ugodnih oglasov", "\n".join(vrstice), self.cakajoci[0][3])
 
     def _pregled(self, db):
         novi = posli = 0
@@ -441,6 +465,7 @@ def main():
     v_zasl = tk.IntVar(value=nast["min_zasluzek"])
     v_int = tk.IntVar(value=nast["interval"])
     v_zagon = tk.BooleanVar(value=nast["ob_zagonu"])
+    v_obv = tk.BooleanVar(value=nast.get("obvestila", True))
     for i, (oznaka, var, od, do) in enumerate([
             ("Popust pod tržno ceno (%)", v_popust, 5, 80),
             ("Najmanjši zaslužek (€)", v_zasl, 0, 1000),
@@ -448,7 +473,9 @@ def main():
         ttk.Label(z3, text=oznaka).grid(row=i, column=0, sticky="w", pady=6, padx=(0, 16))
         ttk.Spinbox(z3, from_=od, to=do, textvariable=var, width=8).grid(row=i, column=1, sticky="w")
     ttk.Checkbutton(z3, text="Zaženi skener ob vklopu računalnika", variable=v_zagon) \
-        .grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 6))
+        .grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 2))
+    ttk.Checkbutton(z3, text="Pošiljaj Windows obvestila (posli se vedno vidijo v zavihku)",
+                    variable=v_obv).grid(row=6, column=0, columnspan=2, sticky="w", pady=(2, 6))
 
     def shrani():
         try:
@@ -459,6 +486,7 @@ def main():
             messagebox.showerror(APP, "Vpiši cela števila.")
             return
         nast["ob_zagonu"] = bool(v_zagon.get())
+        nast["obvestila"] = bool(v_obv.get())
         shrani_nastavitve(nast)
         try:
             zagon_ob_windows(nast["ob_zagonu"])
@@ -466,8 +494,8 @@ def main():
             messagebox.showwarning(APP, f"Samodejnega zagona ni bilo mogoče nastaviti:\n{e}")
         messagebox.showinfo(APP, "Nastavitve shranjene.")
         osvezi()
-    ttk.Button(z3, text="Shrani nastavitve", command=shrani).grid(row=4, column=0, sticky="w", pady=12)
-    ttk.Label(z3, text=f"Podatki: {MAPA}", foreground="#888").grid(row=5, column=0, columnspan=2, sticky="w")
+    ttk.Button(z3, text="Shrani nastavitve", command=shrani).grid(row=7, column=0, sticky="w", pady=12)
+    ttk.Label(z3, text=f"Podatki: {MAPA}", foreground="#888").grid(row=8, column=0, columnspan=2, sticky="w")
 
     # -- osveževanje
     zadnji_kljuc = [None]
